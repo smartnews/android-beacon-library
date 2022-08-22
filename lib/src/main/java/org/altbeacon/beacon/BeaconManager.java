@@ -23,8 +23,10 @@
  */
 package org.altbeacon.beacon;
 
+import android.annotation.SuppressLint;
 import android.annotation.TargetApi;
 import android.app.Notification;
+import android.app.ServiceStartNotAllowedException;
 import android.bluetooth.BluetoothManager;
 import android.content.ComponentName;
 import android.content.Context;
@@ -33,7 +35,9 @@ import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.Message;
 import android.os.Messenger;
 import android.os.RemoteException;
@@ -56,6 +60,8 @@ import org.altbeacon.beacon.service.SettingsData;
 import org.altbeacon.beacon.service.StartRMData;
 import org.altbeacon.beacon.service.scanner.NonBeaconLeScanCallback;
 import org.altbeacon.beacon.simulator.BeaconSimulator;
+import org.altbeacon.beacon.utils.ChangeAwareCopyOnWriteArrayList;
+import org.altbeacon.beacon.utils.ChangeAwareCopyOnWriteArrayListNotifier;
 import org.altbeacon.beacon.utils.ProcessUtils;
 
 import java.util.ArrayList;
@@ -69,7 +75,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CopyOnWriteArraySet;
 
 /**
@@ -113,7 +118,7 @@ public class BeaconManager {
 
 
     @NonNull
-    private final List<BeaconParser> beaconParsers = new CopyOnWriteArrayList<>();
+    private final List<BeaconParser> beaconParsers;
 
     @Nullable
     private NonBeaconLeScanCallback mNonBeaconLeScanCallback;
@@ -125,6 +130,7 @@ public class BeaconManager {
     @Nullable
     private Boolean mScannerInSameProcess = null;
     private boolean mScheduledScanJobsEnabled = false;
+    private boolean mScheduledScanJobsEnabledByFallback = false;
     @Nullable
     private IntentScanStrategyCoordinator mIntentScanStrategyCoordinator = null;
     private static boolean sAndroidLScanningDisabled = false;
@@ -133,6 +139,9 @@ public class BeaconManager {
     @Nullable
     private Notification mForegroundServiceNotification = null;
     private int mForegroundServiceNotificationId = -1;
+
+    private Handler mServiceSyncHandler = new Handler(Looper.getMainLooper());
+    private boolean mServiceSyncScheduled = false;
 
     /**
      * Private lock object for singleton initialization protecting against denial-of-service attack.
@@ -218,6 +227,7 @@ public class BeaconManager {
      * @param p
      */
     public void setForegroundScanPeriod(long p) {
+        LogManager.d(TAG, "API setForegroundScanPeriod "+p);
         foregroundScanPeriod = p;
     }
 
@@ -230,6 +240,7 @@ public class BeaconManager {
      * @param p
      */
     public void setForegroundBetweenScanPeriod(long p) {
+        LogManager.d(TAG, "API setForegroundBetweenScanPeriod "+p);
         foregroundBetweenScanPeriod = p;
     }
 
@@ -242,6 +253,7 @@ public class BeaconManager {
      * @param p
      */
     public void setBackgroundScanPeriod(long p) {
+        LogManager.d(TAG, "API setBackgroundScanPeriod "+p);
         backgroundScanPeriod = p;
     }
 
@@ -251,6 +263,7 @@ public class BeaconManager {
      * @param p
      */
     public void setBackgroundBetweenScanPeriod(long p) {
+        LogManager.d(TAG, "API setBackgroundBetweenScanPeriod "+p);
         backgroundBetweenScanPeriod = p;
         if (android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
                 backgroundBetweenScanPeriod < 15*60*1000 /* 15 min */) {
@@ -265,6 +278,7 @@ public class BeaconManager {
      * @param regionExitPeriod
      */
     public static void setRegionExitPeriod(long regionExitPeriod){
+        LogManager.d(TAG, "API setRegionExitPeriod "+regionExitPeriod);
         sExitRegionPeriod = regionExitPeriod;
         BeaconManager instance = sInstance;
         if (instance != null) {
@@ -306,6 +320,7 @@ public class BeaconManager {
                 instance = sInstance;
                 if (instance == null) {
                     sInstance = instance = new BeaconManager(context);
+                    LogManager.d(TAG, "API BeaconManager constructed ");
                 }
             }
         }
@@ -318,6 +333,16 @@ public class BeaconManager {
         if (!sManifestCheckingDisabled) {
            verifyServiceDeclaration();
          }
+        ChangeAwareCopyOnWriteArrayList<BeaconParser> beaconParsers =  new ChangeAwareCopyOnWriteArrayList<>();
+        beaconParsers.setNotifier(new ChangeAwareCopyOnWriteArrayListNotifier() {
+            @Override
+            public void onChange() {
+                LogManager.d(TAG, "API Beacon parsers changed");
+                BeaconManager.this.applySettings();
+            }
+        });
+
+        this.beaconParsers = beaconParsers;
         this.beaconParsers.add(new AltBeaconParser());
         setScheduledScanJobsEnabledDefault();
     }
@@ -351,6 +376,7 @@ public class BeaconManager {
      * @hide
      */
     public void setScannerInSameProcess(boolean isScanner) {
+        LogManager.d(TAG, "API setScannerInSameProcess "+isScanner);
         mScannerInSameProcess = isScanner;
     }
 
@@ -370,7 +396,7 @@ public class BeaconManager {
      */
    @NonNull
     public List<BeaconParser> getBeaconParsers() {
-        return beaconParsers;
+       return beaconParsers;
     }
 
     /**
@@ -397,6 +423,7 @@ public class BeaconManager {
      */
     @Deprecated
     public void bind(@NonNull BeaconConsumer consumer) {
+        LogManager.d(TAG, "API bind");
         bindInternal(consumer);
     }
 
@@ -411,13 +438,23 @@ public class BeaconManager {
         synchronized (consumers) {
             ConsumerInfo newConsumerInfo = new ConsumerInfo();
             ConsumerInfo alreadyBoundConsumerInfo = consumers.putIfAbsent(consumer, newConsumerInfo);
-            if (alreadyBoundConsumerInfo != null) {
+            boolean needToBind = mScheduledScanJobsEnabledByFallback || alreadyBoundConsumerInfo == null;
+            if (!needToBind) {
                 LogManager.d(TAG, "This consumer is already bound");
             }
             else {
-                LogManager.d(TAG, "This consumer is not bound.  Binding now: %s", consumer);
+                if (mScheduledScanJobsEnabledByFallback) {
+                    LogManager.d(TAG, "Need to rebind for switch to foreground service", consumer);
+                    // we are going to disable the fallbac so we can try a foreground service again
+                    mScheduledScanJobsEnabledByFallback = false;
+                }
+                else {
+                    LogManager.d(TAG, "This consumer is not bound.  Binding now: %s", consumer);
+                }
                 if (mIntentScanStrategyCoordinator != null) {
-                    mIntentScanStrategyCoordinator.start();
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        mIntentScanStrategyCoordinator.start();
+                    }
                     consumer.onBeaconServiceConnect();
                 }
                 else if (mScheduledScanJobsEnabled) {
@@ -429,16 +466,33 @@ public class BeaconManager {
                     Intent intent = new Intent(consumer.getApplicationContext(), BeaconService.class);
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
                             this.getForegroundServiceNotification() != null) {
-                        if (isAnyConsumerBound()) {
+                        if (isAnyConsumerBound() && !mScheduledScanJobsEnabledByFallback) {
                             LogManager.i(TAG, "Not starting foreground beacon scanning" +
                                     " service.  A consumer is already bound, so it should be started");
                         }
                         else {
-                            LogManager.i(TAG, "Starting foreground beacon scanning service.");
-                            mContext.startForegroundService(intent);
+                            LogManager.i(TAG, "Attempting to starting foreground beacon scanning service.");
+                            try {
+                                mContext.startForegroundService(intent);
+                                if (mScheduledScanJobsEnabledByFallback) {
+                                    LogManager.i(TAG, "Successfully switched to foreground service from fallback");
+                                    mScheduledScanJobsEnabledByFallback = false;
+                                    ScanJobScheduler.getInstance().cancelSchedule(mContext);
+                                }
+                                else {
+                                    LogManager.i(TAG, "successfully started foreground beacon scanning service.");
+                                }
+                            }
+                            catch (ServiceStartNotAllowedException e) {
+                                // This happens on Android 12+ if you try to start a service from the background without a
+                                // qualifying event
+                                LogManager.w(TAG, "Foreground service blocked by ServiceStartNotAllowedException.  Falling back to job scheduler");
+                                mScheduledScanJobsEnabledByFallback = true;
+                                syncSettingsToService();
+                                return;
+                            }
                         }
-                    }
-                    else {
+
                     }
                     consumer.bindService(intent, newConsumerInfo.beaconServiceConnection, Context.BIND_AUTO_CREATE);
                 }
@@ -449,25 +503,40 @@ public class BeaconManager {
 
     /**
      * Internal library use only.
-     * This will trigger a failover from the intent scan strategy to jobs or a foreground service
+     * This will trigger a failover from:
+     *   a) the intent scan strategy to jobs or a foreground service
+     *   b) the job scheduler (running on fallback) to the foreground service
      */
     public void handleStategyFailover() {
+        boolean shouldFailover = false;
+        if (mScheduledScanJobsEnabledByFallback) {
+            if (isAnyConsumerBound()) {
+                shouldFailover = true;
+            }
+            else {
+                mScheduledScanJobsEnabledByFallback = false;
+            }
+        }
         if (mIntentScanStrategyCoordinator != null) {
             if (mIntentScanStrategyCoordinator.getDisableOnFailure() && mIntentScanStrategyCoordinator.getLastStrategyFailureDetectionCount() > 0) {
+                shouldFailover = true;
                 mIntentScanStrategyCoordinator = null;
-                LogManager.d(TAG, "unbinding all consumers for failover from intent strategy");
-                List<InternalBeaconConsumer> oldConsumers = new ArrayList<InternalBeaconConsumer>(consumers.keySet());
-                for (InternalBeaconConsumer consumer: oldConsumers) {
-                    this.unbindInternal(consumer);
-                }
-                // No reason to delay between the two of these because there is no asynchonous behavior
-                // on unbinding with the intent scan strategy -- it is not a service
-                LogManager.d(TAG, "binding all consumers for failover from intent strategy");
-                for (InternalBeaconConsumer consumer: oldConsumers) {
-                    this.bindInternal(consumer);
-                }
-                LogManager.d(TAG, "Done with failover");
             }
+        }
+
+        if (shouldFailover) {
+            LogManager.i(TAG, "unbinding all consumers for stategy failover");
+            List<InternalBeaconConsumer> oldConsumers = new ArrayList<InternalBeaconConsumer>(consumers.keySet());
+            for (InternalBeaconConsumer consumer: oldConsumers) {
+                this.unbindInternal(consumer);
+            }
+            // No reason to delay between the two of these because there is no asynchonous behavior
+            // on unbinding with the intent scan strategy or scheduled jobs -- they are not services
+            LogManager.i(TAG, "binding all consumers for strategy failover");
+            for (InternalBeaconConsumer consumer: oldConsumers) {
+                this.bindInternal(consumer);
+            }
+            LogManager.i(TAG, "Done with failover");
         }
     }
 
@@ -480,6 +549,7 @@ public class BeaconManager {
      */
     @Deprecated
     public void unbind(@NonNull BeaconConsumer consumer) {
+        LogManager.d(TAG, "API unbind");
         unbindInternal(consumer);
     }
 
@@ -498,7 +568,7 @@ public class BeaconManager {
                 if (mIntentScanStrategyCoordinator != null) {
                     LogManager.d(TAG, "Not unbinding as we are using intent scanning strategy");
                 }
-                else if (mScheduledScanJobsEnabled) {
+                else if (mScheduledScanJobsEnabled || mScheduledScanJobsEnabledByFallback) {
                     LogManager.d(TAG, "Not unbinding from scanning service as we are using scan jobs.");
                 }
                 else {
@@ -512,7 +582,7 @@ public class BeaconManager {
                     // release the serviceMessenger.
                     serviceMessenger = null;
                     // If we are using scan jobs, we cancel the active scan job
-                    if (mScheduledScanJobsEnabled || mIntentScanStrategyCoordinator != null) {
+                    if (mScheduledScanJobsEnabled || mScheduledScanJobsEnabledByFallback || mIntentScanStrategyCoordinator != null) {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                             LogManager.i(TAG, "Cancelling scheduled jobs after unbind of last consumer.");
                             ScanJobScheduler.getInstance().cancelSchedule(mContext);
@@ -544,7 +614,7 @@ public class BeaconManager {
             // Annotation doesn't guarantee we get a non-null, but raising an NPE here is excessive
             //noinspection ConstantConditions
             return consumer != null && consumers.get(consumer) != null &&
-                    (mScheduledScanJobsEnabled || serviceMessenger != null);
+                    (mScheduledScanJobsEnabled || mScheduledScanJobsEnabledByFallback || serviceMessenger != null);
         }
     }
 
@@ -557,7 +627,7 @@ public class BeaconManager {
     public boolean isAnyConsumerBound() {
         synchronized(consumers) {
             return !consumers.isEmpty() &&
-                    (mIntentScanStrategyCoordinator != null || mScheduledScanJobsEnabled || serviceMessenger != null);
+                    (mIntentScanStrategyCoordinator != null || mScheduledScanJobsEnabled || mScheduledScanJobsEnabledByFallback || serviceMessenger != null);
         }
     }
 
@@ -583,6 +653,7 @@ public class BeaconManager {
      */
     @Deprecated
     public void setBackgroundMode(boolean backgroundMode) {
+        LogManager.d(TAG, "API setBackgroundMode "+backgroundMode);
         setBackgroundModeInternal(backgroundMode);
     }
 
@@ -591,6 +662,7 @@ public class BeaconManager {
      * @hide
      */
     public void setBackgroundModeInternal(boolean backgroundMode) {
+        LogManager.d(TAG, "API setBackgroundModeIternal "+backgroundMode);
         if (!isBleAvailableOrSimulated()) {
             LogManager.w(TAG, "Method invocation will be ignored.");
             return;
@@ -636,6 +708,7 @@ public class BeaconManager {
      */
 
     public void setEnableScheduledScanJobs(boolean enabled) {
+        LogManager.d(TAG, "API setEnableScheduledScanJobs "+enabled);
         if (isAnyConsumerBound()) {
             LogManager.e(TAG, "ScanJob may not be configured because a consumer is" +
                     " already bound.");
@@ -650,13 +723,17 @@ public class BeaconManager {
             LogManager.w(TAG, "Disabling ScanJobs on Android 8+ may disable delivery of "+
                     "beacon callbacks in the background unless a foreground service is active.");
         }
-        if(!enabled && android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            ScanJobScheduler.getInstance().cancelSchedule(mContext);
+        if (enabled) {
+            mScheduledScanJobsEnabledByFallback = false;
         }
         mScheduledScanJobsEnabled = enabled;
+        if(!(mScheduledScanJobsEnabled || mScheduledScanJobsEnabledByFallback) && android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            ScanJobScheduler.getInstance().cancelSchedule(mContext);
+        }
     }
 
     public void setIntentScanningStrategyEnabled(boolean enabled) {
+        LogManager.d(TAG, "API setIntentScanningStrategyEnabled "+enabled);
         if (isAnyConsumerBound()) {
             LogManager.e(TAG, "IntentScanningStrategy may not be configured because a consumer is" +
                     " already bound.");
@@ -668,6 +745,8 @@ public class BeaconManager {
             return;
         }
         if(enabled && android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            mScheduledScanJobsEnabled = false;
+            mScheduledScanJobsEnabledByFallback = false;
             ScanJobScheduler.getInstance().cancelSchedule(mContext);
             mIntentScanStrategyCoordinator = new IntentScanStrategyCoordinator(mContext);
         }
@@ -724,6 +803,7 @@ public class BeaconManager {
      */
     @Deprecated
     public void setRangeNotifier(@Nullable RangeNotifier notifier) {
+        LogManager.d(TAG, "API setRangeNotifier "+notifier);
         rangeNotifiers.clear();
         if (null != notifier) {
             addRangeNotifier(notifier);
@@ -742,6 +822,7 @@ public class BeaconManager {
      * @see RangeNotifier
      */
     public void addRangeNotifier(@NonNull RangeNotifier notifier) {
+        LogManager.d(TAG, "API addRangeNotifier "+notifier);
         //noinspection ConstantConditions
         if (notifier != null) {
             rangeNotifiers.add(notifier);
@@ -755,6 +836,7 @@ public class BeaconManager {
      * @see RangeNotifier
      */
     public boolean removeRangeNotifier(@NonNull RangeNotifier notifier) {
+        LogManager.d(TAG, "API removeRangeNotifier "+notifier);
         return rangeNotifiers.remove(notifier);
     }
 
@@ -762,6 +844,7 @@ public class BeaconManager {
      * Remove all the Range Notifiers.
      */
     public void removeAllRangeNotifiers() {
+        LogManager.d(TAG, "API removeAllRangeNotifiers");
         rangeNotifiers.clear();
     }
 
@@ -781,6 +864,7 @@ public class BeaconManager {
      */
     @Deprecated
     public void setMonitorNotifier(@Nullable MonitorNotifier notifier) {
+        LogManager.d(TAG, "API setMonitorNotifier "+notifier);
         if (determineIfCalledFromSeparateScannerProcess()) {
             return;
         }
@@ -804,6 +888,7 @@ public class BeaconManager {
      * @see Region
      */
     public void addMonitorNotifier(@NonNull MonitorNotifier notifier) {
+        LogManager.d(TAG, "API addMonitorNotifier "+notifier);
         if (determineIfCalledFromSeparateScannerProcess()) {
             return;
         }
@@ -831,6 +916,7 @@ public class BeaconManager {
      * @see Region
      */
     public boolean removeMonitorNotifier(@NonNull MonitorNotifier notifier) {
+        LogManager.d(TAG, "API removeMonitorNotifier "+notifier);
         if (determineIfCalledFromSeparateScannerProcess()) {
             return false;
         }
@@ -841,6 +927,7 @@ public class BeaconManager {
      * Remove all the Monitor Notifiers.
      */
     public void removeAllMonitorNotifiers() {
+        LogManager.d(TAG, "API removeAllMonitorNotifiers");
         if (determineIfCalledFromSeparateScannerProcess()) {
             return;
         }
@@ -866,6 +953,7 @@ public class BeaconManager {
      * @param enabled true to enable the region state persistence, false to disable it.
      */
     public void setRegionStatePersistenceEnabled(boolean enabled) {
+        LogManager.d(TAG, "API setRegionStatePerisistenceEnabled "+enabled);
         mRegionStatePersistenceEnabled = enabled;
         if (!isScannerInDifferentProcess()) {
             if (enabled) {
@@ -923,6 +1011,7 @@ public class BeaconManager {
     @Deprecated
     @TargetApi(18)
     public void startRangingBeaconsInRegion(@NonNull Region region) throws RemoteException {
+        LogManager.d(TAG, "API startRangingBeaconsInRegion "+region);
         LogManager.d(TAG, "startRangingBeaconsInRegion");
         if (!isBleAvailableOrSimulated()) {
             LogManager.w(TAG, "Method invocation will be ignored.");
@@ -954,6 +1043,7 @@ public class BeaconManager {
      */
     @TargetApi(18)
     public void startRangingBeacons(@NonNull Region region) {
+        LogManager.d(TAG, "API startRangingBeacons "+region);
         LogManager.d(TAG, "startRanging");
         ensureBackgroundPowerSaver();
         if (isAnyConsumerBound()) {
@@ -987,6 +1077,7 @@ public class BeaconManager {
     @Deprecated
     @TargetApi(18)
     public void stopRangingBeaconsInRegion(@NonNull Region region) throws RemoteException {
+        LogManager.d(TAG, "API stopRangingBeacons "+region);
         LogManager.d(TAG, "stopRangingBeaconsInRegion");
         if (!isBleAvailableOrSimulated()) {
             LogManager.w(TAG, "Method invocation will be ignored.");
@@ -1011,6 +1102,7 @@ public class BeaconManager {
      */
     @TargetApi(18)
     public void stopRangingBeacons(@NonNull Region region) {
+        LogManager.d(TAG, "API stopRangingBeacons "+region);
         LogManager.d(TAG, "stopRangingBeacons");
         ensureBackgroundPowerSaver();
         if (isAnyConsumerBound()) {
@@ -1029,39 +1121,57 @@ public class BeaconManager {
     }
 
     /**
-     * Call this method if you are running the scanner service in a different process in order to
-     * synchronize any configuration settings, including BeaconParsers to the scanner
-     * @see #isScannerInDifferentProcess()
+     * Call this method in order to apply your settings changes to the already running scanning process
      */
     public void applySettings() {
+        LogManager.d(TAG, "API applySettings");
         if (determineIfCalledFromSeparateScannerProcess()) {
             return;
         }
         if (!isAnyConsumerBound()) {
             LogManager.d(TAG, "Not synchronizing settings to service, as it has not started up yet");
-        } else if (isScannerInDifferentProcess()) {
-            LogManager.d(TAG, "Synchronizing settings to service");
-            syncSettingsToService();
         } else {
-            LogManager.d(TAG, "Not synchronizing settings to service, as it is in the same process");
+            syncSettingsToService();
         }
     }
 
-    protected void syncSettingsToService() {
+    protected synchronized void syncSettingsToService() {
         if (mIntentScanStrategyCoordinator != null) {
             mIntentScanStrategyCoordinator.applySettings();
             return;
         }
-        if (mScheduledScanJobsEnabled) {
+        if (mScheduledScanJobsEnabled || mScheduledScanJobsEnabledByFallback) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 ScanJobScheduler.getInstance().applySettingsToScheduledJob(mContext, this);
             }
             return;
         }
-        try {
-            applyChangesToServices(BeaconService.MSG_SYNC_SETTINGS, null);
-        } catch (RemoteException e) {
-            LogManager.e(TAG, "Failed to sync settings to service", e);
+        if (!isAnyConsumerBound()) {
+            // If no services are bound, there is no reason to sync settings
+            LogManager.d(TAG, "No settings sync to running service -- service not bound");
+            return;
+        }
+
+        // Because may API calls may be called in sequence, here we batch the sync to the service.
+        if (mServiceSyncScheduled == false) {
+            // call this at most every 100ms
+            mServiceSyncScheduled = true;
+            LogManager.d(TAG, "API Scheduling settings sync to running service.");
+            mServiceSyncHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    mServiceSyncScheduled = false;
+                    try {
+                        LogManager.d(TAG, "API Performing settings sync to running service.");
+                        applyChangesToServices(BeaconService.MSG_SYNC_SETTINGS, null);
+                    } catch (RemoteException e) {
+                        LogManager.e(TAG, "Failed to sync settings to service", e);
+                    }
+                }
+            }, 100l);
+        }
+        else {
+            LogManager.d(TAG, "Already scheduled settings sync to running service.");
         }
     }
 
@@ -1084,6 +1194,8 @@ public class BeaconManager {
     @Deprecated
     @TargetApi(18)
     public void startMonitoringBeaconsInRegion(@NonNull Region region) throws RemoteException {
+        LogManager.d(TAG, "API startMonitoringBeaconsInRegion "+region);
+
         if (!isBleAvailableOrSimulated()) {
             LogManager.w(TAG, "Method invocation will be ignored.");
             return;
@@ -1119,6 +1231,7 @@ public class BeaconManager {
      */
     @TargetApi(18)
     public void startMonitoring(@NonNull Region region) {
+        LogManager.d(TAG, "API startMonitoring "+region);
         ensureBackgroundPowerSaver();
         if (isAnyConsumerBound()) {
             try {
@@ -1154,6 +1267,7 @@ public class BeaconManager {
     @Deprecated
     @TargetApi(18)
     public void stopMonitoringBeaconsInRegion(@NonNull Region region) throws RemoteException {
+        LogManager.d(TAG, "API stopMonitoringBeaconsInRegion "+region);
         if (!isBleAvailableOrSimulated()) {
             LogManager.w(TAG, "Method invocation will be ignored.");
             return;
@@ -1198,6 +1312,7 @@ public class BeaconManager {
      */
     @TargetApi(18)
     public void stopMonitoring(@NonNull Region region) {
+        LogManager.d(TAG, "API stopMonitoring "+region);
         ensureBackgroundPowerSaver();
         if (isAnyConsumerBound()) {
             try {
@@ -1222,6 +1337,8 @@ public class BeaconManager {
      */
     @TargetApi(18)
     public void updateScanPeriods() throws RemoteException {
+        LogManager.d(TAG, "API updateScanPeriods");
+
         if (!isBleAvailableOrSimulated()) {
             LogManager.w(TAG, "Method invocation will be ignored.");
             return;
@@ -1230,7 +1347,7 @@ public class BeaconManager {
             return;
         }
         LogManager.d(TAG, "updating background flag to %s", mBackgroundMode);
-        LogManager.d(TAG, "updating scan period to %s, %s", this.getScanPeriod(), this.getBetweenScanPeriod());
+        LogManager.d(TAG, "updating scan periods to %s, %s", this.getScanPeriod(), this.getBetweenScanPeriod());
         if (isAnyConsumerBound()) {
             applyChangesToServices(BeaconService.MSG_SET_SCAN_PERIODS, null);
         }
@@ -1246,7 +1363,7 @@ public class BeaconManager {
             mIntentScanStrategyCoordinator.applySettings();
             return;
         }
-        if (mScheduledScanJobsEnabled) {
+        if (mScheduledScanJobsEnabled || mScheduledScanJobsEnabledByFallback) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 ScanJobScheduler.getInstance().applySettingsToScheduledJob(mContext, this);
             }
@@ -1344,7 +1461,7 @@ public class BeaconManager {
      */
     @NonNull
     public Collection<Region> getMonitoredRegions() {
-        return MonitoringStatus.getInstanceForApplication(mContext).regions();
+        return MonitoringStatus.getInstanceForApplication(mContext).getActiveRegions();
     }
 
     /**
@@ -1440,10 +1557,12 @@ public class BeaconManager {
      * @param maxTrackingAge in milliseconds
      */
     public void setMaxTrackingAge(int maxTrackingAge) {
+        LogManager.d(TAG, "API setMaxTrackingAge "+maxTrackingAge);
         RangedBeacon.setMaxTrackinAge(maxTrackingAge);
     }
 
     public static void setBeaconSimulator(BeaconSimulator beaconSimulator) {
+        LogManager.d(TAG, "API setBeaconSimulator "+beaconSimulator);
         warnIfScannerNotInSameProcess();
         BeaconManager.beaconSimulator = beaconSimulator;
     }
@@ -1455,6 +1574,7 @@ public class BeaconManager {
 
 
     protected void setDataRequestNotifier(@Nullable RangeNotifier notifier) {
+        LogManager.d(TAG, "API setDataRequestNotifier "+notifier);
         this.dataRequestNotifier = notifier;
     }
 
@@ -1469,6 +1589,7 @@ public class BeaconManager {
     }
 
     public void setNonBeaconLeScanCallback(@Nullable NonBeaconLeScanCallback callback) {
+        LogManager.d(TAG, "API setNonBeaconLeScanCallback "+callback);
         mNonBeaconLeScanCallback = callback;
     }
 
@@ -1587,6 +1708,7 @@ public class BeaconManager {
      * @deprecated This will be removed in the 3.0 release
      */
     public static void setAndroidLScanningDisabled(boolean disabled) {
+        LogManager.d(TAG, "API setAndroidLScanningDisabled "+disabled);
         sAndroidLScanningDisabled = disabled;
         BeaconManager instance = sInstance;
         if (instance != null) {
@@ -1611,6 +1733,7 @@ public class BeaconManager {
      * @param disabled
      */
     public static void setManifestCheckingDisabled(boolean disabled) {
+        LogManager.d(TAG, "API setManifestCheckingDisabled "+disabled);
         sManifestCheckingDisabled = disabled;
     }
 
@@ -1648,6 +1771,8 @@ public class BeaconManager {
      */
     public void enableForegroundServiceScanning(Notification notification, int notificationId)
             throws IllegalStateException {
+        LogManager.d(TAG, "API enableForegroundServiceScanning "+notification);
+
         if (isAnyConsumerBound()) {
             throw new IllegalStateException("May not be called after consumers are already bound.");
         }
@@ -1657,6 +1782,41 @@ public class BeaconManager {
         setEnableScheduledScanJobs(false);
         mForegroundServiceNotification = notification;
         mForegroundServiceNotificationId = notificationId;
+    }
+
+    /**
+     *  Because Android 12 blocks starting foreground services under some conditions, the library
+     *  may fall back to using the Job Scheduler to schedule scans in these cases.  When this
+     *  happens, it may be possible to start a foreground service at a later time once a
+     *  qualifying event happens.  The library will automatically do this if the app comes to
+     *  the foreground (one example of a qualifying event.)  But the app itself may detect other
+     *  qualifying events defined here:
+     *
+     *  https://developer.android.com/guide/components/foreground-services#background-start-restrictions
+     *
+     *  If the app detects one of these events and wants to retry starting foreground service
+     *  scanning, call this method.
+     *
+     *  Calling this method does not guarantee that the retry will succeed, and if it does not,
+     *  the Job Scheduler will continue to be used.
+     *
+     * @see #foregroundServiceStartFailed() to determine if this method call may be helpful.
+     */
+    public void retryForegroundServiceScanning() {
+        if (foregroundServiceStartFailed()) {
+            handleStategyFailover();
+        }
+    }
+
+    /**
+     * Returns whether Android has blocked using a requsted foreground service to do scans.
+     *
+     *  @see #retryForegroundServiceScanning() for more info.
+     *
+     * @return
+     */
+    public boolean foregroundServiceStartFailed() {
+        return mScheduledScanJobsEnabledByFallback;
     }
 
     /**
@@ -1671,6 +1831,7 @@ public class BeaconManager {
      * service
      */
     public void disableForegroundServiceScanning() throws IllegalStateException {
+        LogManager.d(TAG, "API disableForegroundServiceScanning");
         if (isAnyConsumerBound()) {
             throw new IllegalStateException("May not be called after consumers are already bound");
         }

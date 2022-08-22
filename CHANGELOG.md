@@ -1,3 +1,24 @@
+### 2.19.5-beta8 / 2022-07-26
+
+- Expose raw bytes of beacon and accept AD type 0x07 (#1098, David G. Young)
+
+### 2.19.5-beta7 / 2022-06-24
+
+- Fix Crash on Android 13 beta (#1095, David G. Young)
+- Handle Foreground Service Start Failures in Android 12 (#1090, David G. Young)
+- Fix region persistence usability problems (#1089, David G. Young)
+- Fix bugs with changing BeaconParsers for running scan service (#1091, David G. Young)
+
+### 2.19.4 / 2022-03-10
+
+- Add ApiTrackingLogger (#1078, David G. Young)
+- Allow scanning with only BLUETOOTH_SCAN permission and not just location permissions. (#1065, Marcel Schnelle)
+- Fix bug blocking job scheduler scans on Android 12. (#1077, David G. Young)
+
+### 2.19.3 / 2021-10-5
+
+- Fix failing intent-backed scans broken by Android 12 changes in the 2.19 release. (#1059, David G. Young)
+
 ### 2.19.2 / 2021-08-18
 
 - Fix NullPointerException in IntentScanStrategyCoordinator (#1053, PhilipTocsen)
